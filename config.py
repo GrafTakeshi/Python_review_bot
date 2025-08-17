@@ -16,6 +16,8 @@ class Config:
     NOTIFICATION_TIME = "09:00"
     NOTIFICATION_TZ = "Europe/Moscow"
     NOTIFICATION_ENABLED = True
+    REQUIRED_APPROVALS = 2  # Количество необходимых одобрений
+    MAX_REJECTIONS = 3  # Максимальное количество отклонений перед снятием с ревью
 
 logging.basicConfig(
     level=Config.LOG_LEVEL,

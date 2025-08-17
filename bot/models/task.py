@@ -4,7 +4,6 @@ from datetime import datetime
 
 Base = declarative_base()
 
-
 class Task(Base):
     __tablename__ = 'tasks'
 
@@ -17,6 +16,8 @@ class Task(Base):
     status = Column(Boolean, default=False)
     approve_count = Column(Integer, default=0)
     approved_by = Column(JSON, default=list)
+    reject_count = Column(Integer, default=0)  # Новое поле - счетчик отклонений
+    rejected_by = Column(JSON, default=list)  # Новое поле - список отклонивших
     created_at = Column(DateTime, default=datetime.now)
     completed_at = Column(DateTime, nullable=True)
 

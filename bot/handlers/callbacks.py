@@ -17,6 +17,21 @@ class CallbackHandler(BaseHandler):
     Реализует всю бизнес-логику взаимодействия с кнопками
     """
 
+    def _get_user_name_by_id(self, user_id):
+        """Получает имя пользователя по ID (кеширует запросы)"""
+        if not hasattr(self, '_user_cache'):
+            self._user_cache = {}
+
+        if user_id not in self._user_cache:
+            try:
+                user_info = self.bot.bot.get_user_info(user_id)
+                name = f"{user_info.get('firstName', '')} {user_info.get('lastName', '')}".strip()
+                self._user_cache[user_id] = name or user_id
+            except Exception:
+                self._user_cache[user_id] = user_id
+
+        return self._user_cache[user_id]
+
     def handle(self, event):
         """
         Главный обработчик callback-событий от inline-кнопок
@@ -92,9 +107,6 @@ class CallbackHandler(BaseHandler):
         """
         Начинает процесс добавления новой задачи на ревью
         Устанавливает начальное состояние пользователя
-
-        Args:
-            event (Event): Объект события callback
         """
         try:
             user_id = event.data['from']['userId']
@@ -129,25 +141,21 @@ class CallbackHandler(BaseHandler):
             if not state or 'data' not in state:
                 raise ValueError("Не найдены данные задачи")
 
-            # Получаем информацию о пользователе
-            user_info = event.data['from']
-            creator_name = f"{user_info.get('firstName', '')} {user_info.get('lastName', '')}".strip()
-            creator_name = creator_name if creator_name else user_info.get('userId', 'Unknown')
-
             # Формируем данные задачи
             task_data = {
                 'user_id': user_id,
-                'creator': creator_name,
+                'creator': self._format_user_name(event.data['from']),
                 'description': state['data'].get('description', ''),
                 'youtrack_url': state['data'].get('youtrack_url', ''),
                 'confluence_url': state['data'].get('confluence_url', ''),
                 'status': False,
                 'approve_count': 0,
-                'approved_by': []
+                'approved_by': [],
+                'reject_count': 0,  # Инициализируем новые поля
+                'rejected_by': []
             }
 
             with DatabaseManager().session() as db:
-                # Создаем и сохраняем задачу
                 task = self.tasks.create_task(db, task_data)
                 db.commit()
 
@@ -164,9 +172,6 @@ class CallbackHandler(BaseHandler):
                 # Очищаем состояние
                 self.state.clear_state(user_id)
 
-        except ValueError as e:
-            logger.error(f"Ошибка валидации: {str(e)}")
-            self._send_error(event, "Ошибка: неполные данные задачи")
         except Exception as e:
             logger.error(f"Ошибка создания задачи: {str(e)}", exc_info=True)
             self._send_error(event, "Ошибка при сохранении задачи")
@@ -219,21 +224,14 @@ class CallbackHandler(BaseHandler):
         return user_info.get('userId', 'Unknown')
 
     def _show_task_for_review(self, event):
-        """
-        Отображает полную информацию о задаче для ревью
-
-        Args:
-            event (Event): Объект события callback
-        """
+        """Отображает полную информацию о задаче для ревью"""
         try:
             task_id = int(event.data['callbackData'].split('_')[-1])
             chat_id = event.data['message']['chat']['chatId']
             user_id = event.data['from']['userId']
 
-            logger.info(f"Showing task {task_id} for review by user {user_id}")
-
             with DatabaseManager().session() as db:
-                task = self.tasks.get_task(db, task_id)
+                task = db.query(Task).filter(Task.id == task_id).first()
 
                 if not task:
                     raise ValueError(f"Task {task_id} not found")
@@ -247,17 +245,9 @@ class CallbackHandler(BaseHandler):
                     )
                     return
 
-                # Проверка статуса задачи
-                if task.status:
-                    self.bot.bot.send_text(
-                        chat_id=chat_id,
-                        text="✅ Эта задача уже завершена!",
-                        inline_keyboard_markup=self.keyboards.get_main_keyboard()
-                    )
-                    return
-
                 # Формирование сообщения с информацией о задаче
                 approved_by = ", ".join(task.approved_by) if task.approved_by else "пока нет"
+                rejected_by = ", ".join(task.rejected_by) if task.rejected_by else "пока нет"
 
                 response = (
                     "📝 Задача на ревью\n\n"
@@ -269,7 +259,9 @@ class CallbackHandler(BaseHandler):
                     f"YouTrack: {task.youtrack_url}\n"
                     f"Confluence: {task.confluence_url}\n\n"
                     f"Одобрений: {task.approve_count}\n"
-                    f"Одобрили: {approved_by}"
+                    f"Одобрили: {approved_by}\n\n"
+                    f"Отклонений: {task.reject_count}\n"
+                    f"Отклонили: {rejected_by}"
                 )
 
                 # Отправка сообщения с кнопками действий
@@ -290,9 +282,6 @@ class CallbackHandler(BaseHandler):
         """
         Инициирует процесс одобрения задачи
         Запрашивает подтверждение перед одобрением
-
-        Args:
-            event (Event): Объект события callback
         """
         try:
             task_id = int(event.data['callbackData'].split('_')[-1])
@@ -329,27 +318,22 @@ class CallbackHandler(BaseHandler):
             )
 
     def _confirm_approve(self, event):
-        """
-        Подтверждает одобрение задачи и обновляет данные в БД
-
-        Args:
-            event (Event): Объект события callback
-        """
+        """Подтверждает одобрение задачи и проверяет достижение лимита"""
         try:
             task_id = int(event.data['callbackData'].split('_')[-1])
             user_id = event.data['from']['userId']
             chat_id = event.data['message']['chat']['chatId']
-
-            logger.info(f"Confirming approval for task {task_id} by user {user_id}")
+            reviewer_name = self._get_user_name(event)
 
             with DatabaseManager().session() as db:
-                task = self.tasks.get_task(db, task_id)
+                task = db.query(Task).filter(Task.id == task_id).first()
 
                 if not task:
                     raise ValueError(f"Task {task_id} not found")
 
                 # Проверяем, не одобрял ли уже пользователь
-                if user_id in task.approved_by:
+                approved_by = task.approved_by if task.approved_by else []
+                if user_id in approved_by:
                     self.bot.bot.send_text(
                         chat_id=chat_id,
                         text="ℹ️ Вы уже одобряли эту задачу",
@@ -357,23 +341,24 @@ class CallbackHandler(BaseHandler):
                     )
                     return
 
-                # Обновляем список одобривших
-                approved_by = task.approved_by or []
+                # Добавляем одобрение
                 approved_by.append(user_id)
                 task.approved_by = approved_by
                 task.approve_count = len(approved_by)
 
-                # Проверяем, достигнуто ли необходимое количество одобрений
-                if task.approve_count >= 2:  # Пример: требуется 2 одобрения
+                # Проверяем достижение лимита одобрений
+                if task.approve_count >= Config.REQUIRED_APPROVALS:
                     task.status = True
                     task.completed_at = datetime.now()
 
-                    # Отправляем уведомление в группу
-                    approvers = ", ".join(task.approved_by)
+                    # Уведомление в групповой чат
+                    approvers = ", ".join([self._get_user_name_by_id(u) for u in approved_by])
                     group_message = (
-                        "🎉 Задача завершена!\n\n"
+                        "🎉 Задача успешно завершена!\n\n"
                         f"ID: #{task.id}\n"
+                        f"Автор: {task.creator}\n"
                         f"Описание: {task.description}\n\n"
+                        f"Одобрений: {task.approve_count}/{Config.REQUIRED_APPROVALS}\n"
                         f"Одобрили: {approvers}"
                     )
 
@@ -382,12 +367,19 @@ class CallbackHandler(BaseHandler):
                         text=group_message
                     )
 
+                    # Уведомление автору
+                    self.bot.bot.send_text(
+                        chat_id=task.user_id,
+                        text=f"✅ Ваша задача #{task.id} успешно прошла ревью!"
+                    )
+
                 db.commit()
 
-                # Отправляем подтверждение пользователю
+                # Ответ ревьюеру
                 self.bot.bot.send_text(
                     chat_id=chat_id,
-                    text="✅ Вы успешно одобрили задачу!",
+                    text=f"✅ Вы одобрили задачу #{task_id}\n"
+                         f"Текущий статус: {task.approve_count}/{Config.REQUIRED_APPROVALS}",
                     inline_keyboard_markup=self.keyboards.get_main_keyboard()
                 )
 
@@ -398,9 +390,131 @@ class CallbackHandler(BaseHandler):
                 text="❌ Ошибка при одобрении задачи"
             )
 
-    # Остальные методы (_request_revision, _start_review_process и т.д.)
-    # реализуются по аналогии с приведенными выше примерами
-    # с сохранением одинакового стиля и подхода
+    def _request_revision(self, event):
+        """Отправляет задачу на доработку"""
+        try:
+            task_id = int(event.data['callbackData'].split('_')[-1])
+            chat_id = event.data['message']['chat']['chatId']
+
+            logger.info(f"Revision requested for task {task_id}")
+
+            # Создаем клавиатуру для подтверждения
+            keyboard = InlineKeyboardMarkup()
+            keyboard.row(
+                KeyboardButton(
+                    text="✅ Подтвердить доработку",
+                    callbackData=f"confirm_revision_{task_id}",
+                    style="primary"
+                ),
+                KeyboardButton(
+                    text="❌ Отмена",
+                    callbackData="cancel_action",
+                    style="attention"
+                )
+            )
+
+            self.bot.bot.send_text(
+                chat_id=chat_id,
+                text="Вы уверены, что хотите отправить задачу на доработку?",
+                inline_keyboard_markup=keyboard
+            )
+
+        except Exception as e:
+            logger.error(f"Error requesting revision: {str(e)}", exc_info=True)
+            self.bot.bot.send_text(
+                chat_id=event.data['message']['chat']['chatId'],
+                text="❌ Ошибка при обработке запроса"
+            )
+
+    def _confirm_revision(self, event):
+        """Обрабатывает отправку на доработку с проверкой лимита отклонений"""
+        try:
+            task_id = int(event.data['callbackData'].split('_')[-1])
+            chat_id = event.data['message']['chat']['chatId']
+            reviewer_id = event.data['from']['userId']
+            reviewer_name = self._get_user_name(event)
+
+            with DatabaseManager().session() as db:
+                task = db.query(Task).filter(Task.id == task_id).first()
+
+                if not task:
+                    raise ValueError("Задача не найдена")
+
+                # Добавляем в список отклонивших
+                rejected_by = task.rejected_by if task.rejected_by else []
+                if reviewer_id not in rejected_by:
+                    rejected_by.append(reviewer_id)
+                    task.rejected_by = rejected_by
+                    task.reject_count = len(rejected_by)
+
+                # Проверяем достижение лимита отклонений
+                if task.reject_count >= Config.MAX_REJECTIONS:
+                    # Уведомление автору
+                    rejecters = ", ".join([self._get_user_name_by_id(u) for u in rejected_by])
+                    author_message = (
+                        f"🚨 Ваша задача #{task_id} снята с ревью!\n\n"
+                        f"Причина: достигнут лимит отклонений ({task.reject_count}/{Config.MAX_REJECTIONS})\n"
+                        f"Отклонили: {rejecters}\n\n"
+                        f"Название: {task.description}\n"
+                        f"YouTrack: {task.youtrack_url}"
+                    )
+
+                    self.bot.bot.send_text(
+                        chat_id=task.user_id,
+                        text=author_message
+                    )
+
+                    # Уведомление ревьюерам
+                    for user_id in rejected_by:
+                        if user_id != reviewer_id:  # Текущему ревьюеру отправим отдельное сообщение
+                            self.bot.bot.send_text(
+                                chat_id=user_id,
+                                text=f"Задача #{task_id} снята с ревью (достигнут лимит отклонений)"
+                            )
+
+                    # Удаляем задачу
+                    db.delete(task)
+                    db.commit()
+
+                    # Ответ текущему ревьюеру
+                    self.bot.bot.send_text(
+                        chat_id=chat_id,
+                        text="Спасибо за ревью! Задача снята по достижению лимита отклонений.",
+                        inline_keyboard_markup=self.keyboards.get_main_keyboard()
+                    )
+                    return
+
+                # Если лимит не достигнут - стандартная процедура
+                db.commit()
+
+                # Уведомление автору о доработке
+                author_message = (
+                    f"🔧 {reviewer_name} отправил задачу на доработку\n\n"
+                    f"ID: #{task.id}\n"
+                    f"Текущие отклонения: {task.reject_count}/{Config.MAX_REJECTIONS}\n\n"
+                    f"Описание: {task.description}\n"
+                    f"YouTrack: {task.youtrack_url}"
+                )
+
+                self.bot.bot.send_text(
+                    chat_id=task.user_id,
+                    text=author_message
+                )
+
+                # Ответ ревьюеру
+                self.bot.bot.send_text(
+                    chat_id=chat_id,
+                    text=f"✅ Задача #{task_id} отправлена на доработку\n"
+                         f"Текущие отклонения: {task.reject_count}/{Config.MAX_REJECTIONS}",
+                    inline_keyboard_markup=self.keyboards.get_main_keyboard()
+                )
+
+        except Exception as e:
+            logger.error(f"Error confirming revision: {str(e)}", exc_info=True)
+            self.bot.bot.send_text(
+                chat_id=event.data['message']['chat']['chatId'],
+                text="❌ Ошибка при отправке на доработку"
+            )
 
     def _cancel_task(self, event):
         """Отменяет процесс создания задачи"""
@@ -503,45 +617,6 @@ class CallbackHandler(BaseHandler):
             chat_id = event.data['message']['chat']['chatId']
 
             with DatabaseManager().session() as db:
-                tasks = self.tasks.get_user_tasks(db, user_id)
-
-                if not tasks:
-                    self.bot.bot.send_text(
-                        chat_id=chat_id,
-                        text="У вас нет задач для снятия с ревью",
-                        inline_keyboard_markup=self.keyboards.get_main_keyboard()
-                    )
-                    return
-
-                keyboard = InlineKeyboardMarkup(buttons_in_row=1)
-                for task in tasks:
-                    keyboard.row(
-                        KeyboardButton(
-                            text=f"Задача #{task.id}: {task.description[:30]}...",
-                            callbackData=f"select_task_{task.id}"
-                        )
-                    )
-
-                self.bot.bot.send_text(
-                    chat_id=chat_id,
-                    text="Выберите задачу для снятия с ревью:",
-                    inline_keyboard_markup=keyboard
-                )
-
-        except Exception as e:
-            logger.error(f"Error starting remove process: {str(e)}", exc_info=True)
-            self.bot.bot.send_text(
-                chat_id=event.data['message']['chat']['chatId'],
-                text="Ошибка при получении списка задач"
-            )
-
-    def _start_remove_process(self, event):
-        """Начинает процесс снятия задачи с ревью"""
-        try:
-            user_id = event.data['from']['userId']
-            chat_id = event.data['message']['chat']['chatId']
-
-            with DatabaseManager().session() as db:
                 tasks = db.query(Task).filter(
                     Task.user_id == user_id,
                     Task.status == False
@@ -577,61 +652,59 @@ class CallbackHandler(BaseHandler):
                 text="Ошибка при получении списка задач"
             )
 
-    def _show_task_for_removal(self, event):
-        """Показывает задачу для подтверждения снятия"""
+    def _show_task_for_review(self, event):
+        """Отображает полную информацию о задаче для ревью"""
         try:
             task_id = int(event.data['callbackData'].split('_')[-1])
             chat_id = event.data['message']['chat']['chatId']
             user_id = event.data['from']['userId']
 
             with DatabaseManager().session() as db:
-                task = db.query(Task).filter(
-                    Task.id == task_id,
-                    Task.user_id == user_id
-                ).first()
+                task = db.query(Task).filter(Task.id == task_id).first()
 
                 if not task:
-                    raise ValueError("Задача не найдена или не принадлежит вам")
+                    raise ValueError(f"Task {task_id} not found")
+
+                # Проверка, что пользователь не ревьюит свою задачу
+                if task.user_id == user_id:
+                    self.bot.bot.send_text(
+                        chat_id=chat_id,
+                        text="⚠️ Вы не можете ревьюить свои задачи!",
+                        inline_keyboard_markup=self.keyboards.get_main_keyboard()
+                    )
+                    return
+
+                # Формирование сообщения с информацией о задаче
+                approved_by = ", ".join(task.approved_by) if task.approved_by else "пока нет"
+                rejected_by = ", ".join(task.rejected_by) if task.rejected_by else "пока нет"
 
                 response = (
-                    "Вы точно хотите снять эту задачу с ревью?\n\n"
-                    f"ID: {task.id}\n"
-                    f"Описание: {task.description}\n"
-                    f"Статус: {'Завершена' if task.status else 'На ревью'}\n"
-                    f"Одобрений: {task.approve_count}"
+                    "📝 Задача на ревью\n\n"
+                    f"ID: #{task.id}\n"
+                    f"Автор: {task.creator}\n"
+                    f"Дата создания: {task.created_at.strftime('%d.%m.%Y')}\n\n"
+                    f"Описание:\n{task.description}\n\n"
+                    f"Ссылки:\n"
+                    f"YouTrack: {task.youtrack_url}\n"
+                    f"Confluence: {task.confluence_url}\n\n"
+                    f"Одобрений: {task.approve_count}/{Config.REQUIRED_APPROVALS}\n"
+                    f"Одобрили: {approved_by}\n\n"
+                    f"Отклонений: {task.reject_count}/{Config.MAX_REJECTIONS}\n"
+                    f"Отклонили: {rejected_by}"
                 )
 
-                keyboard = InlineKeyboardMarkup()
-                keyboard.row(
-                    KeyboardButton(
-                        text="✅ Да, снять",
-                        callbackData=f"confirm_remove_{task.id}",
-                        style="primary"
-                    ),
-                    KeyboardButton(
-                        text="❌ Нет, отменить",
-                        callbackData="cancel_remove",
-                        style="attention"
-                    )
-                )
-
+                # Отправка сообщения с кнопками действий
                 self.bot.bot.send_text(
                     chat_id=chat_id,
                     text=response,
-                    inline_keyboard_markup=keyboard
+                    inline_keyboard_markup=self.keyboards.get_task_keyboard(task.id)
                 )
 
-        except ValueError as e:
-            logger.error(f"Invalid task ID: {str(e)}")
-            self.bot.bot.send_text(
-                chat_id=event.data['message']['chat']['chatId'],
-                text="Неверный формат ID задачи"
-            )
         except Exception as e:
-            logger.error(f"Error showing task for removal: {str(e)}", exc_info=True)
+            logger.error(f"Error showing task: {str(e)}", exc_info=True)
             self.bot.bot.send_text(
                 chat_id=event.data['message']['chat']['chatId'],
-                text="Ошибка при загрузке задачи"
+                text="❌ Ошибка при загрузке задачи"
             )
 
     def _confirm_removal(self, event):

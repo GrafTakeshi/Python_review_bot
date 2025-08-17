@@ -43,8 +43,8 @@ class DatabaseManager:
         required_columns = [
             'id', 'user_id', 'creator', 'description',
             'youtrack_url', 'confluence_url', 'status',
-            'approve_count', 'approved_by', 'created_at',
-            'completed_at'
+            'approve_count', 'approved_by', 'reject_count',
+            'rejected_by', 'created_at', 'completed_at'
         ]
 
         missing_columns = [col for col in required_columns if col not in existing_columns]
@@ -57,13 +57,11 @@ class DatabaseManager:
         with self.engine.connect() as conn:
             for column in missing_columns:
                 try:
-                    if column == 'created_at':
-                        conn.execute(text("ALTER TABLE tasks ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP"))
-                    elif column == 'completed_at':
-                        conn.execute(text("ALTER TABLE tasks ADD COLUMN completed_at DATETIME"))
-                    else:
-                        logger.warning(f"Неизвестная колонка для миграции: {column}")
-                    logger.info(f"Добавлена колонка: {column}")
+                    if column == 'reject_count':
+                        conn.execute(text("ALTER TABLE tasks ADD COLUMN reject_count INTEGER DEFAULT 0"))
+                    elif column == 'rejected_by':
+                        conn.execute(text("ALTER TABLE tasks ADD COLUMN rejected_by JSON DEFAULT '[]'"))
+                    # ... остальные условия для миграций
                 except Exception as e:
                     logger.error(f"Ошибка добавления колонки {column}: {str(e)}")
                     raise

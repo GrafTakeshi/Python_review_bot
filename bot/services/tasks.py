@@ -43,10 +43,14 @@ class TaskService:
         ).all()
 
     def get_reviewable_tasks(self, db, user_id):
+        """Получает задачи для ревью, исключая свои и отклоненные/одобренные пользователем"""
         return db.query(Task).filter(
             Task.status == False,
-            Task.user_id != user_id
+            Task.user_id != user_id,
+            ~Task.rejected_by.contains([user_id]),  # Исключаем отклоненные пользователем
+            ~Task.approved_by.contains([user_id])   # Исключаем уже одобренные
         ).all()
+
     def get_task(self, db, task_id):
         return db.query(Task).filter()
 
