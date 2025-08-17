@@ -1,22 +1,26 @@
 from bot.core import ReviewBot
-from database import init_db
+from database.manager import DatabaseManager
 from config import Config, logger
 from notifier import TaskNotifier
-import time
-import sys
+import time  # Добавьте этот импорт
 import atexit
-
+import sys
 
 def run_polling():
     try:
-        init_db()
+        # Инициализация БД
+        db_manager = DatabaseManager()
+        db_manager.init_db()
         logger.info("Database initialized")
 
-        bot = ReviewBot(Config.BOT_TOKEN)
+        # Создание бота
+        bot = ReviewBot()
         logger.info("Bot instance created")
 
+        # Запуск уведомлений
         notifier = TaskNotifier(bot) if Config.NOTIFICATION_ENABLED else None
 
+        # Обработка завершения
         def on_exit():
             if notifier:
                 notifier.stop()
@@ -24,6 +28,7 @@ def run_polling():
 
         atexit.register(on_exit)
 
+        # Проверка подключения
         bot_info = bot.bot.self_get()
         if not bot_info.get('ok', False):
             raise ConnectionError("Failed to connect to bot API")
@@ -32,8 +37,9 @@ def run_polling():
         bot.bot.start_polling()
         logger.info("Polling started")
 
+        # Основной цикл
         while True:
-            time.sleep(1)
+            time.sleep(1)  # Теперь time доступен
 
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")

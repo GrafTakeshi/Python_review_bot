@@ -7,12 +7,12 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 class Config:
-    BOT_TOKEN = "Токен"
-    API_URL = "адрес апи"
+    BOT_TOKEN = ""
+    API_URL = ""
     DB_URL = "sqlite:///tasks.db"
     LOGGING = True
     LOG_LEVEL = logging.DEBUG
-    GROUP_CHAT_ID = "группа@chat.agent"
+    GROUP_CHAT_ID = ""
     NOTIFICATION_TIME = "09:00"
     NOTIFICATION_TZ = "Europe/Moscow"
     NOTIFICATION_ENABLED = True
