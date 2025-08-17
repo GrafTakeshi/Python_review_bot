@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  review-bot:
+    build: .
+    container_name: review-bot
+    restart: unless-stopped
+    volumes:
+      - ./tasks.db:/app/tasks.db  # Для сохранения базы данных между перезапусками
+      - ./bot.log:/app/bot.log     # Для сохранения логов
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
